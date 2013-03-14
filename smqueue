@@ -1,0 +1,223 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          smqueue
+# Required-Start:    $local_fs $remote_fs $network $syslog $named
+# Required-Stop:     $local_fs $remote_fs $network $syslog $named
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# X-Interactive:     true
+# Short-Description: Start/stop smqueue
+### END INIT INFO
+
+set -e
+
+SCRIPTNAME="${0##*/}"
+SCRIPTNAME="${SCRIPTNAME##[KS][0-9][0-9]}"
+
+ENV="env -i LANG=C PATH=/usr/local/bin:/usr/bin:/bin"
+
+OBCACHECLEAN_RUN=auto
+OBCACHECLEAN_MODE=daemon
+OPENBTS_ENVVARS=/etc/OpenBTS/OpenBTS.conf
+
+
+SMQUEUE_PATH=$(. $OPENBTS_ENVVARS && echo $SMQUEUE_PATH)
+if [ -z "$SMQUEUE_PATH" ] ; then
+	echo smqueue is not configured, edit /etc/OpenBTS/OpenBTS.conf
+	return 1
+fi
+
+CORE_GEN=$(. $OPENBTS_ENVVARS && echo $CORE_GEN)
+if [ -z "$CORE_GEN" ]; then
+	CORE_GEN=0
+fi
+
+if [ "$CORE_GEN" -eq "1" ]; then
+    #Turn on core generation
+    #echo "Core geration is on"
+    ulimit -c unlimited
+fi
+
+. /lib/lsb/init-functions
+
+test -f /etc/default/rcS && . /etc/default/rcS
+
+
+PIDFILE=$(. $OPENBTS_ENVVARS && echo $SMQUEUE_PID_FILE)
+if [ -z "$PIDFILE" ] ; then
+	#echo ERROR: SMQUEUE_PID_FILE needs to be defined in $OPENBTS_ENVVARS >&2
+	#exit 2
+	PIDFILE="/var/run/smqueue.pid"
+fi
+
+#Autorestart feature
+AUTO_RESTART=$(. $OPENBTS_ENVVARS && echo $AUTO_RESTART)
+if [ -z "$AUTO_RESTART" ] ; then
+    AUTO_RESTART="0"
+fi
+
+SMQUEUE_MONITOR=$(. $OPENBTS_ENVVARS && echo $SMQUEUE_MONITOR)
+if [ -z "$SMQUEUE_MONITOR" ] ; then
+    SMQUEUE_MONITOR=$SMQUEUE_PATH/../scripts/smqueuemon.sh
+fi
+
+
+PRE_COMMAND=$(. $OPENBTS_ENVVARS && echo $PRE_COMMAND)
+AFTER_COMMAND=$(. $OPENBTS_ENVVARS && echo $AFTER_COMMAND)
+
+pidof_smqueue() {
+	# if there is actually an openbts process whose pid is in PIDFILE,
+	# print it and return 0.
+	if [ -e "$PIDFILE" ]; then
+		if pidof smqueue | tr ' ' '\n' | grep -w $(cat $PIDFILE); then
+			return 0
+		fi
+	fi
+	return 1
+}
+
+smqueue_stop() {
+		# if we are here something is broken and we need to try
+		# to exit as nice and clean as possible
+		PID=$(pidof_smqueue) || true
+
+		if [ "${PID}" ]; then
+			# in this case it is everything nice and dandy and we kill openbts
+			echo
+			#log_warning_msg "The OpenBTS configtest failed, so we are trying to kill it manually. This is almost certainly suboptimal, so please make sure your system is working as you'd expect now!"
+                        kill $PID
+		elif [ "$(pidof smqueue)" ]; then
+			if [ "$VERBOSE" != no ]; then
+                                echo " ... failed!"
+			        echo "You may still have some OpenBTS processes running.  There are"
+ 			        echo "processes named 'OpenBTS' which do not match your pid file,"
+			        echo "and in the name of safety, we've left them alone.  Please review"
+			        echo "the situation by hand."
+                        fi
+                        return 1
+		fi
+}
+
+smqueue_wait_stop() {
+	#killall $OPENBTS_MONITOR >/dev/null 2>&1 || true
+	ps auxw | grep $SMQUEUE_MONITOR | awk '{ print $2 }' | xargs kill  >/dev/null 2>&1 || true
+
+	# running ?
+	PIDTMP=$(pidof_smqueue) || true
+	if kill -0 "${PIDTMP:-}" 2> /dev/null; then
+	    PID=$PIDTMP
+	fi
+
+	smqueue_stop
+
+	# wait until really stopped
+	if [ -n "${PID:-}" ]; then
+		i=0
+		while kill -0 "${PID:-}" 2> /dev/null;  do
+        		if [ $i = '60' ]; then
+        			break;
+        	 	else
+        			if [ $i = '0' ]; then
+                			echo -n " ... waiting "
+        			else
+                	      		echo -n "."
+        		 	fi
+        			i=$(($i+1))
+        			sleep 1
+        	      fi
+		 done
+	fi
+	#Plain dirty hack !
+	#killall transceiver >/dev/null 2>&1 || true
+	#Kill monitor
+
+}
+
+
+smqueue_run_monitor() {
+    log_daemon_msg "Run monitoring" "$SMQUEUE_MONITOR"
+    nohup $SMQUEUE_MONITOR >> /var/log/smqueuemon.run 2>&1 &
+    log_end_msg 0
+}
+
+smqueue_do_start() {
+		PID=$(pidof_smqueue) || true
+		if [ -n "$PID" ]; then
+			echo "smqueue is running (pid $PID)."
+			exit 0
+		fi
+		
+		$PRE_COMMAND
+
+		log_daemon_msg "Starting smqueue server" "$SMQUEUE_PATH"
+		RET=$PWD
+		cd $SMQUEUE_PATH
+		nohup ./smqueue >> /var/log/smqueue.run 2>&1 &
+		PID=$!
+		echo $PID > $PIDFILE
+		
+		if [ "$CORE_GEN" -eq "1" ]; then
+		    # Dump everything, see man core
+		    echo "127" > /proc/$PID/coredump_filter
+		fi
+		#wait some time
+		log_end_msg 0
+		if [ "$AUTO_RESTART" -ne "0" ]; then smqueue_run_monitor; fi
+		# This sould be the last instruction
+		cd $RET
+		
+		$AFTER_COMMAND
+
+    return 0
+}
+
+smqueue_do_stop() {
+		log_daemon_msg "Stopping smqueue server" "$SMQUEUE_PATH"
+		if smqueue_wait_stop; then
+                        log_end_msg 0
+                else
+                        log_end_msg 1
+                fi
+    return 0
+}
+
+
+case $1 in
+	restart)
+	    smqueue_do_stop
+	    smqueue_do_start
+	;;
+	start)
+	    smqueue_do_start
+	;;
+	stop)
+	    smqueue_do_stop
+	;;
+	status)
+		PID=$(pidof_smqueue) || true
+		if [ -n "$PID" ]; then
+			echo "smqueue is running (pid $PID)."
+			exit 0
+		else
+			echo "smqueue is NOT running."
+			if [ -e "$PIDFILE" ]; then
+				exit 1
+			else
+				exit 3
+			fi
+		fi
+
+		if [ "$CORE_GEN" -eq "1" ]; then
+		    #Turn on core generation
+		    echo "Core geration is on"
+		    ulimit -c unlimited
+		fi
+
+
+
+	;;
+	*)
+		log_success_msg "Usage: /etc/init.d/smqueue {start|restart|stop|status}"
+		exit 1
+	;;
+esac
